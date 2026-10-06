@@ -1,0 +1,1779 @@
+#!/usr/bin/env python3
+"""Pull an HDMI picture in from the edges so an old TV stops cropping it.
+
+Linux Mint's desktop runs on Xorg. Intel chips, including the Beelink Mini S
+(N5095), have no hardware underscan, so this insets the picture with xrandr:
+the TV still gets its normal mode (often 1920x1080) and the desktop sits inside
+it. The border is what the TV's overscan cuts off.
+
+AMD drivers that expose the underscan property are used when present. A
+Wayland session cannot move the real HDMI picture; log in to Cinnamon on Xorg.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tty
+from dataclasses import dataclass, field
+from pathlib import Path
+
+CONFIG_VERSION = 1
+MIN_CONTENT = (640, 480)
+MAX_FRACTION = 0.25
+RETRY_SECONDS = 45
+
+WAYLAND_MSG = """\
+This is a Wayland session, so xrandr cannot move the real HDMI picture.
+
+On the Beelink, log out of Linux Mint and on the login screen open the
+session menu (the icon next to the password box). Choose "Cinnamon",
+which is the Xorg session, not "Cinnamon on Wayland". Then run underscan again.
+"""
+
+EMULATED_MSG = """\
+xrandr here is only an emulation layer (Xwayland). Changing it would not
+move the picture the TV actually shows.
+
+On Linux Mint, log out and choose the "Cinnamon" session (Xorg), not
+"Cinnamon on Wayland".
+"""
+
+
+class UnderscanError(Exception):
+    pass
+
+
+@dataclass
+class Mode:
+    name: str
+    width: int
+    height: int
+    rate: str
+    current: bool
+    preferred: bool
+
+
+@dataclass
+class Prop:
+    value: str
+    supported: list[str] = field(default_factory=list)
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+@dataclass
+class Output:
+    name: str
+    connected: bool
+    primary: bool
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+    modes: list[Mode] = field(default_factory=list)
+    props: dict[str, Prop] = field(default_factory=dict)
+
+    def current_mode(self) -> Mode | None:
+        for mode in self.modes:
+            if mode.current:
+                return mode
+        for mode in self.modes:
+            if mode.preferred:
+                return mode
+        return self.modes[0] if self.modes else None
+
+
+@dataclass
+class ScreenInfo:
+    width: int
+    height: int
+    outputs: list[Output]
+
+    def connected(self) -> list[Output]:
+        return [o for o in self.outputs if o.connected and o.current_mode()]
+
+    def emulated(self) -> bool:
+        return any("RANDR Emulation" in o.props for o in self.outputs)
+
+    def by_name(self, name: str) -> Output | None:
+        for output in self.outputs:
+            if output.name == name:
+                return output
+        return None
+
+
+@dataclass
+class Margins:
+    left: int
+    right: int
+    top: int
+    bottom: int
+
+    def zero(self) -> bool:
+        return self.left == self.right == self.top == self.bottom == 0
+
+
+@dataclass
+class Attempt:
+    method: str
+    commands: list[list[str]]
+    description: str
+
+
+def config_home() -> Path:
+    override = os.environ.get("UNDERSCAN_HOME")
+    return Path(override) if override else Path.home()
+
+
+def config_path() -> Path:
+    return config_home() / ".config" / "underscan" / "config.json"
+
+
+def autostart_path() -> Path:
+    return config_home() / ".config" / "autostart" / "underscan.desktop"
+
+
+def install_path() -> Path:
+    return config_home() / ".local" / "bin" / "underscan"
+
+
+def log_path() -> Path:
+    return config_home() / ".config" / "underscan" / "apply.log"
+
+
+def session_block_reason() -> str | None:
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return WAYLAND_MSG
+    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
+        return WAYLAND_MSG
+    if not os.environ.get("DISPLAY"):
+        return (
+            "No X display. Run this from a terminal on the Mint desktop "
+            "(the Cinnamon session), not from a bare SSH shell."
+        )
+    return None
+
+
+def parse_xrandr(text: str) -> ScreenInfo:
+    """Parse `xrandr --prop` output. Modes and connector properties both live there."""
+    screen_w, screen_h = 0, 0
+    outputs: list[Output] = []
+    current: Output | None = None
+    current_prop: str | None = None
+    header = re.compile(
+        r"^(\S+) (connected|disconnected)( primary)?"
+        r"(?: (\d+)x(\d+)\+(\d+)\+(\d+))?"
+    )
+    mode_name = re.compile(r"^(\d+)x(\d+)")
+
+    for raw in text.splitlines():
+        if raw.startswith("Screen "):
+            match = re.search(r"current (\d+) x (\d+)", raw)
+            if match:
+                screen_w, screen_h = int(match.group(1)), int(match.group(2))
+            current = None
+            current_prop = None
+            continue
+
+        if raw and not raw[0].isspace():
+            match = header.match(raw)
+            current_prop = None
+            if not match:
+                current = None
+                continue
+            current = Output(
+                name=match.group(1),
+                connected=match.group(2) == "connected",
+                primary=bool(match.group(3)),
+                width=int(match.group(4) or 0),
+                height=int(match.group(5) or 0),
+                x=int(match.group(6) or 0),
+                y=int(match.group(7) or 0),
+            )
+            outputs.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        supported = re.match(r"^\t\tsupported:\s*(.*)$", raw)
+        if supported and current_prop:
+            values = [part.strip() for part in supported.group(1).split(",") if part.strip()]
+            current.props[current_prop].supported = values
+            continue
+
+        ranged = re.match(r"^\t\trange:\s*\((\d+),\s*(\d+)\)", raw)
+        if ranged and current_prop:
+            current.props[current_prop].minimum = int(ranged.group(1))
+            current.props[current_prop].maximum = int(ranged.group(2))
+            continue
+
+        prop = re.match(r"^\t([^:\t][^:]*):\s*(.*?)\s*$", raw)
+        if prop:
+            current_prop = prop.group(1).strip()
+            current.props[current_prop] = Prop(value=prop.group(2).strip())
+            continue
+
+        if raw.startswith(" ") and not raw.startswith("  " * 8):
+            parts = raw.split()
+            if not parts or not mode_name.match(parts[0]):
+                continue
+            name = parts[0]
+            size = mode_name.match(name)
+            assert size is not None
+            width, height = int(size.group(1)), int(size.group(2))
+            for token in parts[1:]:
+                current.modes.append(
+                    Mode(
+                        name=name,
+                        width=width,
+                        height=height,
+                        rate=token.replace("*", "").replace("+", ""),
+                        current="*" in token,
+                        preferred="+" in token,
+                    )
+                )
+            current_prop = None
+
+    return ScreenInfo(width=screen_w, height=screen_h, outputs=outputs)
+
+
+def parse_transform(verbose: str, output_name: str) -> list[float] | None:
+    """Return the 9 transform values printed for one output, if any."""
+    lines = verbose.splitlines()
+    in_output = False
+    for index, line in enumerate(lines):
+        if line and not line[0].isspace():
+            in_output = line.startswith(output_name + " ")
+            continue
+        if not in_output:
+            continue
+        match = re.match(r"^\tTransform:\s*(.*)$", line)
+        if not match:
+            continue
+        numbers = match.group(1).split()
+        for extra in lines[index + 1 : index + 3]:
+            numbers.extend(extra.split())
+        values: list[float] = []
+        for token in numbers:
+            try:
+                values.append(float(token))
+            except ValueError:
+                break
+        if len(values) >= 9:
+            return values[:9]
+    return None
+
+
+def query() -> ScreenInfo:
+    if not shutil.which("xrandr"):
+        raise UnderscanError(
+            "xrandr is not installed. On Linux Mint: sudo apt install x11-xserver-utils"
+        )
+    result = subprocess.run(
+        ["xrandr", "--prop"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "xrandr failed").strip()
+        raise UnderscanError(detail)
+    return parse_xrandr(result.stdout)
+
+
+def ensure_real_x() -> ScreenInfo:
+    reason = session_block_reason()
+    if reason:
+        raise UnderscanError(reason)
+    screen = query()
+    if screen.emulated():
+        raise UnderscanError(EMULATED_MSG)
+    return screen
+
+
+def choose_output(screen: ScreenInfo, name: str | None) -> Output:
+    connected = screen.connected()
+    if not connected:
+        raise UnderscanError(
+            "No connected display. Plug the TV into HDMI and run this again."
+        )
+    if name:
+        output = screen.by_name(name)
+        if output is None or not output.connected or output.current_mode() is None:
+            names = ", ".join(o.name for o in connected) or "none"
+            raise UnderscanError(
+                f"No connected output named {name}. Connected now: {names}."
+            )
+        return output
+    hdmi = [o for o in connected if o.name.upper().startswith("HDMI")]
+    if len(hdmi) == 1:
+        return hdmi[0]
+    if len(connected) == 1:
+        return connected[0]
+    names = ", ".join(o.name for o in connected)
+    raise UnderscanError(
+        "More than one display is connected. Name the TV, for example:\n"
+        f"  underscan set HDMI-1 5%\n"
+        f"Connected: {names}"
+    )
+
+
+def parse_amount(text: str, mode_w: int, mode_h: int) -> Margins:
+    token = text.strip().lower()
+    if token.endswith("%"):
+        try:
+            percent = float(token[:-1])
+        except ValueError as exc:
+            raise UnderscanError(f"Could not read a percentage from {text!r}.") from exc
+        if percent < 0:
+            raise UnderscanError("The percentage cannot be negative.")
+        return Margins(
+            left=int(round(mode_w * percent / 100)),
+            right=int(round(mode_w * percent / 100)),
+            top=int(round(mode_h * percent / 100)),
+            bottom=int(round(mode_h * percent / 100)),
+        )
+    if re.fullmatch(r"\d+", token):
+        pixels = int(token)
+        return Margins(pixels, pixels, pixels, pixels)
+    pair = re.fullmatch(r"(\d+)x(\d+)", token)
+    if pair:
+        horizontal, vertical = int(pair.group(1)), int(pair.group(2))
+        return Margins(horizontal, horizontal, vertical, vertical)
+    corners = re.fullmatch(r"(\d+),(\d+),(\d+),(\d+)", token)
+    if corners:
+        return Margins(*(int(part) for part in corners.groups()))
+    raise UnderscanError(
+        f"Could not read an inset from {text!r}.\n"
+        "Examples: 5%    48    48x27    40,40,24,24\n"
+        "  5%            each edge inset by 5% of that axis\n"
+        "  48            48 pixels on every edge\n"
+        "  48x27         48 pixels left and right, 27 top and bottom\n"
+        "  40,40,24,24   left, right, top, bottom"
+    )
+
+
+def normalize_margins(mode_w: int, mode_h: int, margins: Margins) -> Margins:
+    left = max(0, int(margins.left))
+    right = max(0, int(margins.right))
+    top = max(0, int(margins.top))
+    bottom = max(0, int(margins.bottom))
+    # Intel HDMI scanout wants an even width and height.
+    if (mode_w - left - right) % 2:
+        right += 1
+    if (mode_h - top - bottom) % 2:
+        bottom += 1
+    content_w = mode_w - left - right
+    content_h = mode_h - top - bottom
+    if left > mode_w * MAX_FRACTION or right > mode_w * MAX_FRACTION:
+        raise UnderscanError(
+            f"Horizontal inset is more than {int(MAX_FRACTION * 100)}% of {mode_w}px. "
+            "That would throw away too much of the desktop."
+        )
+    if top > mode_h * MAX_FRACTION or bottom > mode_h * MAX_FRACTION:
+        raise UnderscanError(
+            f"Vertical inset is more than {int(MAX_FRACTION * 100)}% of {mode_h}px. "
+            "That would throw away too much of the desktop."
+        )
+    if content_w < MIN_CONTENT[0] or content_h < MIN_CONTENT[1]:
+        raise UnderscanError(
+            f"That inset leaves {content_w}x{content_h}. "
+            f"Keep at least {MIN_CONTENT[0]}x{MIN_CONTENT[1]}."
+        )
+    return Margins(left, right, top, bottom)
+
+
+def scale_margins(margins: Margins, basis_w: int, basis_h: int, mode_w: int, mode_h: int) -> Margins:
+    if basis_w <= 0 or basis_h <= 0 or (basis_w == mode_w and basis_h == mode_h):
+        return margins
+
+    def scale(value: int, basis: int, mode: int) -> int:
+        return int(round(value * mode / basis))
+
+    return Margins(
+        scale(margins.left, basis_w, mode_w),
+        scale(margins.right, basis_w, mode_w),
+        scale(margins.top, basis_h, mode_h),
+        scale(margins.bottom, basis_h, mode_h),
+    )
+
+
+def fmt_num(value: float) -> str:
+    rounded = round(value)
+    if abs(value - rounded) < 1e-6:
+        return str(int(rounded))
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def hardware_possible(output: Output, margins: Margins) -> str | None:
+    """Return a reason hardware underscan cannot be used, or None if it can."""
+    underscan = output.props.get("underscan")
+    horizontal = output.props.get("underscan hborder")
+    vertical = output.props.get("underscan vborder")
+    if underscan is None or horizontal is None or vertical is None:
+        return "this driver has no underscan property"
+    if margins.left != margins.right or margins.top != margins.bottom:
+        return "hardware underscan uses the same inset on both sides of an axis"
+    if horizontal.maximum is not None and margins.left > horizontal.maximum:
+        return f"the driver only allows {horizontal.maximum}px of horizontal underscan"
+    if vertical.maximum is not None and margins.top > vertical.maximum:
+        return f"the driver only allows {vertical.maximum}px of vertical underscan"
+    supported = [item.lower() for item in underscan.supported]
+    if supported and "on" not in supported:
+        return "the driver does not allow underscan on"
+    return None
+
+
+def mode_argv(output: Output, mode: Mode) -> list[str]:
+    argv = ["--mode", mode.name]
+    if mode.rate:
+        argv += ["--rate", mode.rate]
+    if output.primary:
+        argv.append("--primary")
+    return argv
+
+
+def sharp_matrix(margins: Margins) -> str:
+    return f"1,0,{-margins.left},0,1,{-margins.top},0,0,1"
+
+
+def scale_matrix(mode: Mode, margins: Margins) -> str:
+    visible_w = mode.width - margins.left - margins.right
+    visible_h = mode.height - margins.top - margins.bottom
+    sx = mode.width / visible_w
+    sy = mode.height / visible_h
+    tx = -sx * margins.left
+    ty = -sy * margins.top
+    return f"{fmt_num(sx)},0,{fmt_num(tx)},0,{fmt_num(sy)},{fmt_num(ty)},0,0,1"
+
+
+def plan_sharp(screen: ScreenInfo, output: Output, mode: Mode, margins: Margins) -> list[Attempt]:
+    if len(screen.connected()) != 1:
+        raise UnderscanError(
+            "A crisp inset changes the size of the whole desktop, so it is only "
+            "used when the TV is the only connected display.\n"
+            "Unplug the other display, or run: underscan set --keep-resolution"
+        )
+    content_w = mode.width - margins.left - margins.right
+    content_h = mode.height - margins.top - margins.bottom
+    matrix = sharp_matrix(margins)
+    base = ["xrandr", "--output", output.name, *mode_argv(output, mode)]
+    direct = [
+        "xrandr",
+        "--fb",
+        f"{content_w}x{content_h}",
+        "--output",
+        output.name,
+        *mode_argv(output, mode),
+        "--pos",
+        "0x0",
+        "--transform",
+        matrix,
+    ]
+    shifted = base + [
+        "--transform",
+        matrix,
+        "--panning",
+        f"{mode.width}x{mode.height}+{margins.left}+{margins.top}",
+    ]
+    shrunk = direct + [
+        "--panning",
+        f"{mode.width}x{mode.height}+{margins.left}+{margins.top}",
+    ]
+    return [
+        Attempt("sharp", [direct], "crisp inset"),
+        Attempt("sharp", [shifted, shrunk], "crisp inset, two steps"),
+    ]
+
+
+def plan_scale(screen: ScreenInfo, output: Output, mode: Mode, margins: Margins) -> Attempt:
+    single = len(screen.connected()) == 1
+    if single:
+        fb = f"{mode.width}x{mode.height}"
+        position = ["--pos", "0x0"]
+    else:
+        fb = f"{max(screen.width, 1)}x{max(screen.height, 1)}"
+        position = ["--pos", f"{output.x}x{output.y}"]
+    command = [
+        "xrandr",
+        "--fb",
+        fb,
+        "--output",
+        output.name,
+        *mode_argv(output, mode),
+        *position,
+        "--transform",
+        scale_matrix(mode, margins),
+        "--filter",
+        "bilinear",
+    ]
+    return Attempt("scale", [command], "scaled inset")
+
+
+def plan_hardware(output: Output, mode: Mode, margins: Margins) -> Attempt:
+    command = [
+        "xrandr",
+        "--fb",
+        f"{mode.width}x{mode.height}",
+        "--output",
+        output.name,
+        *mode_argv(output, mode),
+        "--pos",
+        "0x0",
+        "--transform",
+        "none",
+        "--panning",
+        "0x0",
+        "--set",
+        "underscan",
+        "on",
+        "--set",
+        "underscan hborder",
+        str(margins.left),
+        "--set",
+        "underscan vborder",
+        str(margins.top),
+    ]
+    return Attempt("hardware", [command], "hardware underscan")
+
+
+def plan_reset(screen: ScreenInfo, output: Output) -> list[str]:
+    mode = output.current_mode()
+    if mode is None:
+        raise UnderscanError(f"{output.name} has no active mode to restore.")
+    command = ["xrandr", "--output", output.name, *mode_argv(output, mode), "--transform", "none", "--panning", "0x0"]
+    if len(screen.connected()) == 1:
+        command[1:1] = ["--fb", f"{mode.width}x{mode.height}"]
+        command += ["--pos", "0x0"]
+    if "underscan" in output.props:
+        command += [
+            "--set",
+            "underscan",
+            "off",
+            "--set",
+            "underscan hborder",
+            "0",
+            "--set",
+            "underscan vborder",
+            "0",
+        ]
+    return command
+
+
+def plan_apply(
+    screen: ScreenInfo,
+    output: Output,
+    margins: Margins,
+    method: str = "auto",
+) -> list[Attempt]:
+    mode = output.current_mode()
+    if mode is None:
+        raise UnderscanError(f"{output.name} has no mode.")
+    if margins.zero():
+        return [Attempt("reset", [plan_reset(screen, output)], "no inset")]
+
+    requested = method
+    if requested == "auto":
+        if hardware_possible(output, margins) is None and len(screen.connected()) == 1:
+            requested = "hardware"
+        elif len(screen.connected()) == 1:
+            requested = "sharp"
+        else:
+            requested = "scale"
+
+    attempts: list[Attempt] = []
+    if requested == "hardware":
+        reason = hardware_possible(output, margins)
+        if reason:
+            raise UnderscanError(f"Cannot use hardware underscan: {reason}.")
+        attempts.append(plan_hardware(output, mode, margins))
+        if method == "auto":
+            attempts.extend(plan_sharp(screen, output, mode, margins))
+            attempts.append(plan_scale(screen, output, mode, margins))
+        return attempts
+    if requested == "scale":
+        attempts.append(plan_scale(screen, output, mode, margins))
+        return attempts
+    if requested == "sharp":
+        attempts.extend(plan_sharp(screen, output, mode, margins))
+        attempts.append(plan_scale(screen, output, mode, margins))
+        return attempts
+    raise UnderscanError(f"Unknown method {method!r}. Use auto, sharp, or scale.")
+
+
+def command_failed(returncode: int, stderr: str) -> bool:
+    if returncode != 0:
+        return True
+    return any(
+        token in stderr
+        for token in ("X Error of failed request", "BadMatch", "BadValue")
+    )
+
+
+def run_command(argv: list[str], dry_run: bool) -> subprocess.CompletedProcess[str] | None:
+    printable = " ".join(shlex.quote(part) for part in argv)
+    if dry_run:
+        print(printable)
+        return None
+    result = subprocess.run(argv, check=False, text=True, capture_output=True)
+    if command_failed(result.returncode, result.stderr):
+        detail = (result.stderr or result.stdout or "xrandr failed").strip()
+        raise UnderscanError(f"{printable}\n{detail}")
+    return result
+
+
+def sharp_applied(screen: ScreenInfo, margins: Margins) -> bool:
+    if len(screen.connected()) != 1:
+        return False
+    mode = screen.connected()[0].current_mode()
+    if mode is None:
+        return False
+    return (
+        screen.width == mode.width - margins.left - margins.right
+        and screen.height == mode.height - margins.top - margins.bottom
+    )
+
+
+def hardware_applied(output: Output, margins: Margins) -> bool:
+    underscan = output.props.get("underscan")
+    horizontal = output.props.get("underscan hborder")
+    vertical = output.props.get("underscan vborder")
+    if underscan is None or horizontal is None or vertical is None:
+        return False
+    if underscan.value.lower() not in {"on", "auto"}:
+        return False
+    try:
+        return int(float(horizontal.value)) == margins.left and int(float(vertical.value)) == margins.top
+    except ValueError:
+        return False
+
+
+def scale_applied(output: Output, margins: Margins) -> bool:
+    mode = output.current_mode()
+    if mode is None:
+        return False
+    verbose = subprocess.run(
+        ["xrandr", "--verbose"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if verbose.returncode != 0:
+        return False
+    matrix = parse_transform(verbose.stdout, output.name)
+    if matrix is None:
+        return False
+    expected = [float(part) for part in scale_matrix(mode, margins).split(",")]
+    return all(abs(got - want) < 0.02 for got, want in zip(matrix, expected))
+
+
+def inset_is_active(screen: ScreenInfo, output: Output, margins: Margins, method: str) -> bool:
+    if method in {"auto", "hardware"} and hardware_applied(output, margins):
+        return True
+    if method in {"auto", "sharp"} and sharp_applied(screen, margins):
+        return True
+    if method == "scale":
+        return scale_applied(output, margins)
+    return False
+
+
+def verify_attempt(attempt: Attempt, margins: Margins) -> bool:
+    if attempt.method == "reset":
+        return True
+    screen = query()
+    output_name = None
+    for command in attempt.commands:
+        if "--output" in command:
+            output_name = command[command.index("--output") + 1]
+    output = screen.by_name(output_name or "")
+    if output is None:
+        return False
+    if attempt.method == "hardware":
+        return hardware_applied(output, margins)
+    if attempt.method == "sharp":
+        return sharp_applied(screen, margins)
+    if attempt.method == "scale":
+        return scale_applied(output, margins)
+    return False
+
+
+def execute(attempts: list[Attempt], margins: Margins, dry_run: bool) -> str:
+    errors: list[str] = []
+    for attempt in attempts:
+        try:
+            for command in attempt.commands:
+                run_command(command, dry_run)
+        except UnderscanError as exc:
+            errors.append(str(exc))
+            continue
+        if dry_run or verify_attempt(attempt, margins):
+            return attempt.method
+        errors.append(f"{attempt.description} ran but the picture size did not change as expected.")
+    detail = "\n\n".join(errors) if errors else "no xrandr command was attempted"
+    raise UnderscanError(f"Could not inset the picture.\n\n{detail}")
+
+
+def content_type_name(output: Output, want: str) -> str:
+    prop = output.props.get("content type")
+    if prop is None:
+        raise UnderscanError(
+            f"{output.name} does not expose an HDMI content type.\n"
+            "That is normal on some drivers. Use `underscan tune` to inset the picture instead."
+        )
+    for option in prop.supported:
+        if option.lower() == want.lower():
+            return option
+    if not prop.supported:
+        return want
+    choices = ", ".join(prop.supported)
+    raise UnderscanError(f"Content type {want!r} is not supported. This output allows: {choices}")
+
+
+def apply_content_type(output: Output, enabled: bool, dry_run: bool) -> None:
+    value = content_type_name(output, "Graphics" if enabled else "No Data")
+    run_command(
+        ["xrandr", "--output", output.name, "--set", "content type", value],
+        dry_run,
+    )
+
+
+def load_config() -> dict | None:
+    path = config_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise UnderscanError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise UnderscanError(f"{path} is not a JSON object.")
+    return data
+
+
+def save_config(data: dict) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def margins_from_config(data: dict) -> Margins:
+    try:
+        return Margins(int(data["left"]), int(data["right"]), int(data["top"]), int(data["bottom"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnderscanError(f"Saved inset in {config_path()} is incomplete.") from exc
+
+
+def config_from_margins(
+    output: Output,
+    mode: Mode,
+    margins: Margins,
+    method: str,
+    pc_mode: bool,
+    enabled: bool,
+) -> dict:
+    return {
+        "version": CONFIG_VERSION,
+        "enabled": enabled,
+        "output": output.name,
+        "method": method,
+        "pc_mode": pc_mode,
+        "left": margins.left,
+        "right": margins.right,
+        "top": margins.top,
+        "bottom": margins.bottom,
+        "basis_width": mode.width,
+        "basis_height": mode.height,
+    }
+
+
+def install_script() -> Path:
+    source = Path(__file__).resolve()
+    target = install_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source != target:
+        shutil.copy2(source, target)
+        target.chmod(0o755)
+    return target
+
+
+def write_autostart(enabled: bool) -> None:
+    path = autostart_path()
+    if not enabled:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    executable = install_script()
+    path.write_text(
+        "\n".join(
+            [
+                "[Desktop Entry]",
+                "Type=Application",
+                "Name=Underscan",
+                "Comment=Inset the HDMI picture so the TV does not crop the edges",
+                f"Exec={executable} apply --retry {RETRY_SECONDS}",
+                "X-GNOME-Autostart-enabled=true",
+                "X-GNOME-Autostart-Delay=4",
+                "NoDisplay=true",
+                "",
+            ]
+        )
+    )
+
+
+def remember_failure(message: str) -> None:
+    path = log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def describe_result(output: Output, mode: Mode, margins: Margins, used: str) -> str:
+    content_w = mode.width - margins.left - margins.right
+    content_h = mode.height - margins.top - margins.bottom
+    rate = f"@{mode.rate}" if mode.rate else ""
+    lines = [
+        f"{output.name}  {mode.width}x{mode.height}{rate}",
+        (
+            f"Inset: {margins.left}px left, {margins.right}px right, "
+            f"{margins.top}px top, {margins.bottom}px bottom."
+        ),
+    ]
+    if used == "hardware":
+        lines.append(
+            "The GPU is scaling the full desktop into that visible area. "
+            f"The TV still receives {mode.width}x{mode.height}."
+        )
+    elif used == "scale":
+        lines.append(
+            "The full desktop is scaled into that visible area, so windows stay "
+            f"laid out for {mode.width}x{mode.height}. The picture is slightly soft."
+        )
+    elif used == "reset":
+        lines.append("No inset. The desktop goes to the edge of the HDMI picture.")
+    else:
+        lines.append(
+            f"Desktop area is now {content_w}x{content_h}, one desktop pixel per "
+            f"picture pixel. The TV still receives {mode.width}x{mode.height}; "
+            "the border is what it was cropping."
+        )
+    lines.append("Look at the edges with: underscan test")
+    lines.append("Keep this at every login with: underscan save")
+    return "\n".join(lines)
+
+
+def apply_to_output(
+    screen: ScreenInfo,
+    output: Output,
+    margins: Margins,
+    method: str,
+    pc_mode: bool,
+    dry_run: bool,
+) -> str:
+    mode = output.current_mode()
+    if mode is None:
+        raise UnderscanError(f"{output.name} has no active mode.")
+    margins = normalize_margins(mode.width, mode.height, margins)
+    attempts = plan_apply(screen, output, margins, method)
+    used = execute(attempts, margins, dry_run)
+    if pc_mode or (not pc_mode and "content type" in output.props and used != "reset"):
+        # Only force content type off when the caller asked. Leaving a TV's
+        # current infoframe alone is safer than resetting it on every inset.
+        if pc_mode:
+            fresh = output if dry_run else query().by_name(output.name) or output
+            apply_content_type(fresh, True, dry_run)
+    return used
+
+
+def resolved_saved_margins(data: dict, mode: Mode) -> Margins:
+    margins = scale_margins(
+        margins_from_config(data),
+        int(data.get("basis_width") or mode.width),
+        int(data.get("basis_height") or mode.height),
+        mode.width,
+        mode.height,
+    )
+    return normalize_margins(mode.width, mode.height, margins)
+
+
+def cmd_status() -> int:
+    reason = session_block_reason()
+    saved = load_config()
+    if reason:
+        print(reason.strip())
+        if saved:
+            print()
+            print(f"Saved inset (not applied in this session): {config_path()}")
+            print(json.dumps(saved, indent=2))
+        return 2
+    screen = query()
+    if screen.emulated():
+        print(EMULATED_MSG.strip())
+        return 2
+    print(f"Desktop framebuffer: {screen.width}x{screen.height}")
+    if not screen.connected():
+        print("No connected display.")
+    for output in screen.connected():
+        mode = output.current_mode()
+        assert mode is not None
+        hardware = "underscan" in output.props
+        content = output.props.get("content type")
+        print(
+            f"{output.name}: {mode.name} {mode.rate or '?'} Hz"
+            f" at {output.x},{output.y}"
+            f"{' primary' if output.primary else ''}"
+        )
+        print(f"  hardware underscan: {'yes' if hardware else 'no'}")
+        if content is not None:
+            print(f"  HDMI content type: {content.value or 'unknown'}")
+    if saved:
+        state = "on" if saved.get("enabled") else "off"
+        print(
+            f"Saved inset is {state}: "
+            f"{saved.get('left')} left, {saved.get('right')} right, "
+            f"{saved.get('top')} top, {saved.get('bottom')} bottom "
+            f"on {saved.get('output')}"
+        )
+    else:
+        print("Nothing is saved yet. After the edges look right, run: underscan save")
+    return 0
+
+
+def cmd_outputs() -> int:
+    screen = ensure_real_x()
+    for output in screen.outputs:
+        if output.connected and output.current_mode():
+            mode = output.current_mode()
+            assert mode is not None
+            print(f"{output.name} connected {mode.width}x{mode.height}@{mode.rate}")
+        else:
+            print(f"{output.name} disconnected")
+    return 0
+
+
+def method_from_args(args: argparse.Namespace) -> str:
+    if getattr(args, "keep_resolution", False):
+        return "scale"
+    if getattr(args, "sharp", False):
+        return "sharp"
+    return "auto"
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    screen = ensure_real_x()
+    amount = args.amount
+    output_name = args.output
+    if amount and screen.by_name(amount) is not None and args.extra:
+        output_name = amount
+        amount = args.extra
+    elif amount and screen.by_name(amount) is not None and not args.extra:
+        raise UnderscanError(
+            f"{amount} is a display name. Say how far to inset as well, for example:\n"
+            f"  underscan set {amount} 5%"
+        )
+    if not amount:
+        raise UnderscanError(
+            "Say how far to pull the picture in.\n"
+            "  underscan set 5%\n"
+            "  underscan tune"
+        )
+    output = choose_output(screen, output_name)
+    mode = output.current_mode()
+    assert mode is not None
+    margins = normalize_margins(mode.width, mode.height, parse_amount(amount, mode.width, mode.height))
+    used = apply_to_output(screen, output, margins, method_from_args(args), args.pc_mode, args.dry_run)
+    print(describe_result(output, mode, margins, used))
+    if args.save:
+        cmd_save_values(output, mode, margins, used if used != "scale" else "scale", args.pc_mode)
+    return 0
+
+
+def cmd_save_values(output: Output, mode: Mode, margins: Margins, method: str, pc_mode: bool) -> None:
+    stored_method = "auto" if method == "hardware" else method
+    if method == "sharp":
+        stored_method = "sharp"
+    if method == "scale":
+        stored_method = "scale"
+    save_config(config_from_margins(output, mode, margins, stored_method, pc_mode, True))
+    write_autostart(True)
+    print(f"Saved {config_path()}")
+    print("It will be applied again at login, on the Cinnamon (Xorg) session.")
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    saved = load_config()
+    if saved is None:
+        raise UnderscanError("Nothing to save yet. Run `underscan set 5%` or `underscan tune` first.")
+    screen = ensure_real_x()
+    output = choose_output(screen, saved.get("output") or args.output)
+    mode = output.current_mode()
+    assert mode is not None
+    margins = resolved_saved_margins(saved, mode)
+    # Re-read the live picture if the user has been tuning without saving numbers.
+    # The saved file is the source of truth for `underscan save` with no live probe
+    # of margins, because a crisp inset cannot be recovered from the mode alone
+    # once the desktop has already shrunk.
+    used = apply_to_output(
+        screen,
+        output,
+        margins,
+        str(saved.get("method") or "auto"),
+        bool(saved.get("pc_mode")),
+        args.dry_run,
+    )
+    cmd_save_values(output, mode, margins, "sharp" if used == "sharp" else str(saved.get("method") or used), bool(saved.get("pc_mode")))
+    return 0
+
+
+def tuning_lock_path() -> Path:
+    return config_home() / ".config" / "underscan" / "tuning"
+
+
+def tuning_in_progress() -> bool:
+    path = tuning_lock_path()
+    if not path.exists():
+        return False
+    try:
+        started = float(path.read_text().strip() or "0")
+    except ValueError:
+        return False
+    return time.time() - started < 30 * 60
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    saved = load_config()
+    if saved is None or not saved.get("enabled", True):
+        if args.retry:
+            return 0
+        raise UnderscanError("No enabled inset is saved. Run `underscan set` and then `underscan save`.")
+    deadline = time.time() + (args.retry or 0)
+    announced = False
+    active_method = str(saved.get("method") or "auto")
+    while True:
+        if tuning_in_progress():
+            if time.time() >= deadline:
+                return 0
+            time.sleep(2)
+            continue
+        try:
+            reason = session_block_reason()
+            if reason:
+                raise UnderscanError(reason)
+            screen = query()
+            if screen.emulated():
+                raise UnderscanError(EMULATED_MSG)
+            output = choose_output(screen, saved.get("output"))
+            mode = output.current_mode()
+            assert mode is not None
+            margins = resolved_saved_margins(saved, mode)
+            # Mint's display settings often run just after login and wipe xrandr.
+            # Keep putting the inset back until the retry window ends.
+            if args.retry and inset_is_active(screen, output, margins, active_method):
+                if time.time() >= deadline:
+                    return 0
+                time.sleep(2)
+                continue
+            active_method = apply_to_output(
+                screen,
+                output,
+                margins,
+                str(saved.get("method") or "auto"),
+                bool(saved.get("pc_mode")),
+                args.dry_run,
+            )
+            used = active_method
+            if sys.stdout.isatty() and not announced:
+                print(describe_result(output, mode, margins, used))
+                announced = True
+            if args.dry_run or time.time() >= deadline:
+                return 0
+            time.sleep(2)
+        except UnderscanError as exc:
+            if time.time() >= deadline:
+                remember_failure(str(exc))
+                if args.retry and not sys.stdout.isatty():
+                    return 1
+                raise
+            time.sleep(2)
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    saved = load_config()
+    if saved:
+        saved["enabled"] = False
+        save_config(saved)
+    write_autostart(False)
+    reason = session_block_reason()
+    if reason:
+        print("Login will no longer inset the picture.")
+        print(reason.strip())
+        return 0
+    screen = query()
+    if screen.emulated():
+        print("Login will no longer inset the picture.")
+        print(EMULATED_MSG.strip())
+        return 0
+    if not screen.connected():
+        print("Login will no longer inset the picture. No display is connected right now.")
+        return 0
+    output = choose_output(screen, args.output or (saved or {}).get("output"))
+    run_command(plan_reset(screen, output), args.dry_run)
+    print(f"{output.name} is back to the full HDMI picture.")
+    print("It will stay that way at login. `underscan save` turns the last inset back on.")
+    return 0
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    path = config_path()
+    if path.exists():
+        path.unlink()
+    write_autostart(False)
+    print("Removed the saved inset and the login autostart.")
+    if not args.keep_picture:
+        try:
+            cmd_reset(args)
+        except UnderscanError as exc:
+            print(exc)
+    return 0
+
+
+def cmd_pc_mode(args: argparse.Namespace) -> int:
+    screen = ensure_real_x()
+    output = choose_output(screen, args.output)
+    if args.state == "status":
+        prop = output.props.get("content type")
+        if prop is None:
+            print(f"{output.name} does not expose HDMI content type.")
+            return 1
+        print(f"{output.name} content type: {prop.value}")
+        return 0
+    enabled = args.state == "on"
+    apply_content_type(output, enabled, args.dry_run)
+    if enabled:
+        print(
+            f"Asked {output.name} to identify as a computer (HDMI content type Graphics).\n"
+            "If the edges are still cropped, the TV ignored it. Run: underscan tune"
+        )
+    else:
+        print(f"{output.name} HDMI content type set back to No Data.")
+    saved = load_config()
+    if saved and saved.get("output") in {None, output.name}:
+        saved["pc_mode"] = enabled
+        save_config(saved)
+    return 0
+
+
+def cmd_install(_args: argparse.Namespace) -> int:
+    target = install_script()
+    print(f"Installed {target}")
+    print("Open a new terminal if `underscan` is not found yet (~/.local/bin must be on PATH).")
+    print("On the Beelink, log into the Cinnamon session (Xorg), plug in the TV, then:")
+    print("  underscan test")
+    print("  underscan tune")
+    print("  underscan save")
+    return 0
+
+
+def read_key() -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        char = sys.stdin.read(1)
+        if char == "\x1b":
+            import select
+
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                nxt = sys.stdin.read(1)
+                if nxt == "[" and select.select([sys.stdin], [], [], 0.05)[0]:
+                    arrow = sys.stdin.read(1)
+                    return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(arrow, "esc")
+            return "esc"
+        if char == "\x03":
+            raise KeyboardInterrupt
+        return char
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def bump(margins: Margins, key: str) -> Margins | None:
+    step = 2
+    left, right, top, bottom = margins.left, margins.right, margins.top, margins.bottom
+    if key == "right":
+        left += step
+        right += step
+    elif key == "left":
+        left = max(0, left - step)
+        right = max(0, right - step)
+    elif key == "up":
+        top += step
+        bottom += step
+    elif key == "down":
+        top = max(0, top - step)
+        bottom = max(0, bottom - step)
+    elif key == "1":
+        left = max(0, left - step)
+    elif key == "2":
+        left += step
+    elif key == "3":
+        right = max(0, right - step)
+    elif key == "4":
+        right += step
+    elif key == "5":
+        top = max(0, top - step)
+    elif key == "6":
+        top += step
+    elif key == "7":
+        bottom = max(0, bottom - step)
+    elif key == "8":
+        bottom += step
+    else:
+        return None
+    return Margins(left, right, top, bottom)
+
+
+def draw_tune(output: Output, mode: Mode, margins: Margins, message: str) -> None:
+    content_w = mode.width - margins.left - margins.right
+    content_h = mode.height - margins.top - margins.bottom
+    horiz = (margins.left + margins.right) / mode.width * 100
+    vert = (margins.top + margins.bottom) / mode.height * 100
+    sys.stdout.write("\x1b[H\x1b[2J")
+    sys.stdout.write(
+        textwrap.dedent(
+            f"""\
+            Underscan  {output.name}  {mode.width}x{mode.height}@{mode.rate or "?"}
+
+              left {margins.left:4d}    right {margins.right:4d}    top {margins.top:4d}    bottom {margins.bottom:4d}
+              about {horiz / 2:.1f}% of the width and {vert / 2:.1f}% of the height, each side
+              desktop area {content_w}x{content_h}    HDMI signal stays {mode.width}x{mode.height}
+
+            Keys
+              Left / Right     both side edges, in 2px steps
+              Up / Down        both top and bottom
+              1 / 2            left only
+              3 / 4            right only
+              5 / 6            top only
+              7 / 8            bottom only
+              g                jump to a typical TV inset (5% each side)
+              0                no inset
+              t                show the edge test pattern
+              p                ask the TV to switch to PC mode
+              s                save and apply at every login
+              q                keep this and quit
+              Esc              put the picture back how tune found it
+
+            {message}
+            """
+        )
+    )
+    sys.stdout.flush()
+
+
+def cmd_tune(args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty():
+        raise UnderscanError("underscan tune needs a terminal. Use `underscan set 5%` otherwise.")
+    lock = tuning_lock_path()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(time.time()))
+    try:
+        return _tune_session(args)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _tune_session(args: argparse.Namespace) -> int:
+    screen = ensure_real_x()
+    output = choose_output(screen, args.output)
+    mode = output.current_mode()
+    assert mode is not None
+    saved = load_config()
+    if saved and saved.get("output") in {None, output.name} and saved.get("enabled"):
+        current = resolved_saved_margins(saved, mode)
+    else:
+        current = Margins(0, 0, 0, 0)
+    initial = current
+    last_good = current
+    pc_mode = bool(saved and saved.get("pc_mode"))
+    message = "Grow the inset until you can see every edge of a window."
+    while True:
+        try:
+            current = normalize_margins(mode.width, mode.height, current)
+            last_good = current
+        except UnderscanError as exc:
+            message = str(exc)
+            current = last_good
+        screen = query()
+        output = choose_output(screen, output.name)
+        mode = output.current_mode() or mode
+        try:
+            apply_to_output(screen, output, current, method_from_args(args), False, args.dry_run)
+            if pc_mode:
+                apply_content_type(output, True, args.dry_run)
+        except UnderscanError as exc:
+            message = str(exc).splitlines()[0]
+        draw_tune(output, mode, current, message)
+        key = read_key()
+        updated = bump(current, key)
+        if updated is not None:
+            current = updated
+            message = "Applied."
+            continue
+        if key == "g":
+            current = parse_amount("5%", mode.width, mode.height)
+            message = "Starting guess: 5% on each edge. Nudge from here."
+        elif key == "0":
+            current = Margins(0, 0, 0, 0)
+            message = "Inset cleared."
+        elif key == "t":
+            show_test_pattern(0, 0, screen.width, screen.height)
+            message = "If any colored corner was missing, grow the inset on that side."
+        elif key == "p":
+            pc_mode = not pc_mode
+            try:
+                apply_content_type(output, pc_mode, args.dry_run)
+                message = "PC mode on." if pc_mode else "PC mode off."
+            except UnderscanError as exc:
+                pc_mode = False
+                message = str(exc).splitlines()[0]
+        elif key == "s":
+            fresh = query()
+            output = choose_output(fresh, output.name)
+            mode = output.current_mode() or mode
+            used = "scale" if args.keep_resolution else ("sharp" if args.sharp else "auto")
+            # Store the method that will be reused. auto is right when they didn't force one.
+            cmd_save_values(output, mode, normalize_margins(mode.width, mode.height, current), used, pc_mode)
+            saved = load_config() or saved
+            message = "Saved. This inset comes back at login."
+        elif key in {"q", "\r", "\n"}:
+            fresh = query()
+            output = choose_output(fresh, output.name)
+            mode = output.current_mode() or mode
+            enabled = bool(saved and saved.get("enabled"))
+            save_config(
+                config_from_margins(
+                    output,
+                    mode,
+                    normalize_margins(mode.width, mode.height, current),
+                    method_from_args(args),
+                    pc_mode,
+                    enabled,
+                )
+            )
+            print("\nKept the current inset.")
+            if enabled:
+                print("Login will keep applying it.")
+            else:
+                print("Run `underscan save` to apply it at every login.")
+            return 0
+        elif key == "esc":
+            screen = query()
+            output = choose_output(screen, output.name)
+            apply_to_output(screen, output, initial, method_from_args(args), False, args.dry_run)
+            print("\nReverted to the inset from when tune started.")
+            return 0
+
+
+def show_test_pattern(x: int, y: int, width: int, height: int) -> None:
+    if width < 100 or height < 100:
+        raise UnderscanError("The desktop is too small to draw a test pattern.")
+    try:
+        _show_test_pattern_x11(x, y, width, height)
+    except OSError:
+        _show_test_pattern_tk(x, y, width, height)
+
+
+def _show_test_pattern_tk(x: int, y: int, width: int, height: int) -> None:
+    try:
+        import tkinter as tk
+    except ImportError as exc:
+        raise UnderscanError(
+            "Could not open a test window. Install Python's Tk support:\n"
+            "  sudo apt install python3-tk"
+        ) from exc
+
+    root = tk.Tk()
+    root.geometry(f"{width}x{height}+{x}+{y}")
+    root.configure(bg="black")
+    root.overrideredirect(True)
+    canvas = tk.Canvas(root, width=width, height=height, bg="black", highlightthickness=0)
+    canvas.pack()
+    _paint_tk(canvas, width, height)
+    root.bind("<Escape>", lambda _event: root.destroy())
+    root.bind("<q>", lambda _event: root.destroy())
+    root.bind("<Button-1>", lambda _event: root.destroy())
+    root.mainloop()
+
+
+def _paint_tk(canvas, width: int, height: int) -> None:
+    canvas.create_rectangle(0, 0, width - 1, height - 1, outline="white", width=4)
+    size = 72
+    corners = [
+        (0, 0, "red", "TOP LEFT"),
+        (width - size, 0, "green", "TOP RIGHT"),
+        (0, height - size, "blue", "BOTTOM LEFT"),
+        (width - size, height - size, "yellow", "BOTTOM RIGHT"),
+    ]
+    for cx, cy, color, _label in corners:
+        canvas.create_rectangle(cx, cy, cx + size, cy + size, fill=color, outline=color)
+    canvas.create_text(
+        width / 2,
+        height / 2,
+        fill="white",
+        text="If you can see all four colored corners and the white border,\n"
+        "the TV is no longer cropping the desktop.\n\n"
+        "Press Esc or click to close.",
+        justify="center",
+        font=("DejaVu Sans", 18),
+    )
+
+
+class _XSetWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("background_pixmap", ctypes.c_ulong),
+        ("background_pixel", ctypes.c_ulong),
+        ("border_pixmap", ctypes.c_ulong),
+        ("border_pixel", ctypes.c_ulong),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("cursor", ctypes.c_ulong),
+    ]
+
+
+class _XColor(ctypes.Structure):
+    _fields_ = [
+        ("pixel", ctypes.c_ulong),
+        ("red", ctypes.c_ushort),
+        ("green", ctypes.c_ushort),
+        ("blue", ctypes.c_ushort),
+        ("flags", ctypes.c_char),
+        ("pad", ctypes.c_char),
+    ]
+
+
+class _XEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_byte * 252)]
+
+
+def _show_test_pattern_x11(x: int, y: int, width: int, height: int) -> None:
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise OSError("libX11 test pattern is implemented for 64-bit only")
+    lib = ctypes.CDLL("libX11.so.6")
+    xid = ctypes.c_ulong
+    lib.XOpenDisplay.restype = ctypes.c_void_p
+    lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    lib.XDefaultScreen.restype = ctypes.c_int
+    lib.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    lib.XRootWindow.restype = xid
+    lib.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.XBlackPixel.restype = xid
+    lib.XBlackPixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.XWhitePixel.restype = xid
+    lib.XWhitePixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.XDefaultColormap.restype = xid
+    lib.XDefaultColormap.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.XCreateWindow.restype = xid
+    lib.XCreateWindow.argtypes = [
+        ctypes.c_void_p,
+        xid,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(_XSetWindowAttributes),
+    ]
+    lib.XCreateGC.restype = ctypes.c_void_p
+    lib.XCreateGC.argtypes = [ctypes.c_void_p, xid, ctypes.c_ulong, ctypes.c_void_p]
+    lib.XAllocColor.argtypes = [ctypes.c_void_p, xid, ctypes.POINTER(_XColor)]
+    lib.XSetForeground.argtypes = [ctypes.c_void_p, ctypes.c_void_p, xid]
+    lib.XFillRectangle.argtypes = [
+        ctypes.c_void_p,
+        xid,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+    lib.XDrawRectangle.argtypes = lib.XFillRectangle.argtypes
+    lib.XDrawString.argtypes = [
+        ctypes.c_void_p,
+        xid,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    lib.XLoadQueryFont.restype = ctypes.c_void_p
+    lib.XLoadQueryFont.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.XSetFont.argtypes = [ctypes.c_void_p, ctypes.c_void_p, xid]
+    lib.XTextWidth.restype = ctypes.c_int
+    lib.XTextWidth.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.XMapWindow.argtypes = [ctypes.c_void_p, xid]
+    lib.XRaiseWindow.argtypes = [ctypes.c_void_p, xid]
+    lib.XStoreName.argtypes = [ctypes.c_void_p, xid, ctypes.c_char_p]
+    lib.XFlush.argtypes = [ctypes.c_void_p]
+    lib.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XEvent)]
+    lib.XLookupKeysym.restype = xid
+    lib.XLookupKeysym.argtypes = [ctypes.POINTER(_XEvent), ctypes.c_int]
+    lib.XFreeGC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.XDestroyWindow.argtypes = [ctypes.c_void_p, xid]
+    lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display = lib.XOpenDisplay(None)
+    if not display:
+        raise UnderscanError("Could not open the X display for the test pattern.")
+    screen = lib.XDefaultScreen(display)
+    root = lib.XRootWindow(display, screen)
+    black = lib.XBlackPixel(display, screen)
+    white = lib.XWhitePixel(display, screen)
+    colormap = lib.XDefaultColormap(display, screen)
+    attrs = _XSetWindowAttributes()
+    attrs.background_pixel = black
+    attrs.border_pixel = black
+    attrs.override_redirect = 1
+    attrs.event_mask = (1 << 0) | (1 << 2) | (1 << 15)
+    valuemask = (1 << 1) | (1 << 3) | (1 << 9) | (1 << 11)
+    window = lib.XCreateWindow(
+        display,
+        root,
+        x,
+        y,
+        width,
+        height,
+        0,
+        0,
+        1,
+        None,
+        valuemask,
+        ctypes.byref(attrs),
+    )
+    lib.XStoreName(display, window, b"Underscan test")
+    gc = lib.XCreateGC(display, window, 0, None)
+    font = lib.XLoadQueryFont(display, b"fixed")
+    if font:
+        fid = ctypes.c_ulong.from_address(font + ctypes.sizeof(ctypes.c_void_p)).value
+        lib.XSetFont(display, gc, fid)
+
+    def color(red: int, green: int, blue: int) -> int:
+        spec = _XColor()
+        spec.red = red
+        spec.green = green
+        spec.blue = blue
+        spec.flags = 7
+        if lib.XAllocColor(display, colormap, ctypes.byref(spec)) == 0:
+            return white
+        return spec.pixel
+
+    palette = {
+        "white": white,
+        "red": color(65535, 0, 0),
+        "green": color(0, 65535, 0),
+        "blue": color(0, 0, 65535),
+        "yellow": color(65535, 65535, 0),
+    }
+
+    def draw() -> None:
+        lib.XSetForeground(display, gc, black)
+        lib.XFillRectangle(display, window, gc, 0, 0, width, height)
+        lib.XSetForeground(display, gc, palette["white"])
+        lib.XDrawRectangle(display, window, gc, 1, 1, width - 3, height - 3)
+        lib.XDrawRectangle(display, window, gc, 2, 2, width - 5, height - 5)
+        size = 72
+        for cx, cy, name in (
+            (0, 0, "red"),
+            (width - size, 0, "green"),
+            (0, height - size, "blue"),
+            (width - size, height - size, "yellow"),
+        ):
+            lib.XSetForeground(display, gc, palette[name])
+            lib.XFillRectangle(display, window, gc, cx, cy, size, size)
+        lib.XSetForeground(display, gc, palette["white"])
+        lines = [
+            "All four colored corners and the white border should be visible.",
+            "If one is cropped, increase the inset on that side.",
+            "Press Esc, q, or click to close.",
+        ]
+        baseline = height // 2 - 20
+        for line in lines:
+            encoded = line.encode()
+            text_width = lib.XTextWidth(font, encoded, len(encoded)) if font else len(line) * 6
+            lib.XDrawString(
+                display,
+                window,
+                gc,
+                max(8, (width - text_width) // 2),
+                baseline,
+                encoded,
+                len(encoded),
+            )
+            baseline += 16
+        lib.XFlush(display)
+
+    lib.XMapWindow(display, window)
+    lib.XRaiseWindow(display, window)
+    lib.XFlush(display)
+    draw()
+    event = _XEvent()
+    while True:
+        lib.XNextEvent(display, ctypes.byref(event))
+        if event.type == 12:
+            draw()
+        elif event.type == 4:
+            break
+        elif event.type == 2:
+            symbol = lib.XLookupKeysym(ctypes.byref(event), 0)
+            if symbol in {0xFF1B, 0x71, 0x51}:
+                break
+    lib.XFreeGC(display, gc)
+    lib.XDestroyWindow(display, window)
+    lib.XCloseDisplay(display)
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    screen = ensure_real_x()
+    output = choose_output(screen, args.output)
+    # Cover the X desktop on that output. After a crisp inset the framebuffer
+    # is already the visible area, so a window over the whole screen shows
+    # whether the TV still crops it.
+    if len(screen.connected()) == 1:
+        show_test_pattern(0, 0, screen.width, screen.height)
+    else:
+        show_test_pattern(output.x, output.y, max(output.width, 1), max(output.height, 1))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="underscan",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Inset an HDMI picture so an old TV stops hiding the edges.",
+        epilog=textwrap.dedent(
+            """\
+            examples:
+              underscan test                 see which edges the TV is cutting off
+              underscan pc-mode on           ask the TV to treat the input as a PC
+              underscan set 5%               pull every edge in by 5%
+              underscan set 48x27            48px left/right, 27px top/bottom
+              underscan tune                 nudge it while looking at the TV
+              underscan save                 apply the same inset at every login
+              underscan reset                full picture again, including at login
+
+            On the Beelink Mini S, install once inside Linux Mint:
+              mkdir -p ~/.local/bin
+              cp underscan ~/.local/bin/underscan && chmod +x ~/.local/bin/underscan
+              underscan install
+
+            Log into the Cinnamon session (Xorg). "Cinnamon on Wayland" cannot
+            move the HDMI picture. If the TV menu has Just Scan, Screen Fit,
+            1:1, or PC, turn that on first; you may not need an inset at all.
+            """
+        ),
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the xrandr command and do not change the picture",
+    )
+    common.add_argument("--output", help="output name, for example HDMI-1")
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("status", parents=[common], help="show the connected outputs and any saved inset")
+    sub.add_parser("outputs", parents=[common], help="list outputs")
+    sub.add_parser("install", help="copy this program to ~/.local/bin")
+
+    set_parser = sub.add_parser("set", parents=[common], help="inset the picture")
+    set_parser.add_argument("amount", nargs="?", help="5%%, 48, 48x27, or left,right,top,bottom")
+    set_parser.add_argument("extra", nargs="?", help=argparse.SUPPRESS)
+    set_parser.add_argument("--save", action="store_true", help="also apply this inset at login")
+    set_parser.add_argument("--pc-mode", action="store_true", help="also mark the HDMI signal as a computer")
+    set_parser.add_argument("--sharp", action="store_true", help="shrink the desktop so pixels stay 1:1")
+    set_parser.add_argument(
+        "--keep-resolution",
+        action="store_true",
+        help="scale the current desktop into the visible area instead of shrinking it",
+    )
+
+    tune = sub.add_parser("tune", parents=[common], help="nudge the inset from the keyboard while looking at the TV")
+    tune.add_argument("--sharp", action="store_true")
+    tune.add_argument("--keep-resolution", action="store_true")
+
+    sub.add_parser("test", parents=[common], help="cover the screen with corner markers")
+    sub.add_parser("save", parents=[common], help="keep the saved inset and apply it at login")
+    sub.add_parser("reset", parents=[common], help="remove the inset now and at login")
+    forget = sub.add_parser("forget", parents=[common], help="delete the saved inset")
+    forget.add_argument("--keep-picture", action="store_true", help="do not also reset the live picture")
+
+    apply_parser = sub.add_parser("apply", parents=[common], help="apply the saved inset (used at login)")
+    apply_parser.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        help="keep trying for this many seconds if the TV is not ready yet",
+    )
+
+    pc = sub.add_parser("pc-mode", parents=[common], help="ask the TV to disable overscan via the HDMI infoframe")
+    pc.add_argument("state", choices=("on", "off", "status"))
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd is None:
+        parser.print_help()
+        return 0
+    commands = {
+        "status": lambda: cmd_status(),
+        "outputs": lambda: cmd_outputs(),
+        "install": lambda: cmd_install(args),
+        "set": lambda: cmd_set(args),
+        "tune": lambda: cmd_tune(args),
+        "test": lambda: cmd_test(args),
+        "save": lambda: cmd_save(args),
+        "reset": lambda: cmd_reset(args),
+        "forget": lambda: cmd_forget(args),
+        "apply": lambda: cmd_apply(args),
+        "pc-mode": lambda: cmd_pc_mode(args),
+    }
+    try:
+        return commands[args.cmd]()
+    except UnderscanError as exc:
+        print(str(exc).strip(), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
