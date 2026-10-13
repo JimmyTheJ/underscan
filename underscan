@@ -32,6 +32,9 @@ CONFIG_VERSION = 1
 MIN_CONTENT = (640, 480)
 MAX_FRACTION = 0.25
 RETRY_SECONDS = 45
+# RandR monitor name. It must not match an output name such as HDMI-1.
+# A leading "*" in the xrandr argument marks it primary; the name itself does not include the star.
+MENU_MONITOR = "underscan"
 
 WAYLAND_MSG = """\
 This is a Wayland session, so xrandr cannot move the real HDMI picture.
@@ -81,6 +84,8 @@ class Output:
     y: int = 0
     width: int = 0
     height: int = 0
+    mm_width: int = 0
+    mm_height: int = 0
     modes: list[Mode] = field(default_factory=list)
     props: dict[str, Prop] = field(default_factory=dict)
 
@@ -201,6 +206,10 @@ def parse_xrandr(text: str) -> ScreenInfo:
                 x=int(match.group(6) or 0),
                 y=int(match.group(7) or 0),
             )
+            millimeters = re.search(r"(\d+)mm x (\d+)mm\s*$", raw)
+            if millimeters:
+                current.mm_width = int(millimeters.group(1))
+                current.mm_height = int(millimeters.group(2))
             outputs.append(current)
             continue
 
@@ -445,6 +454,42 @@ def mode_argv(output: Output, mode: Mode) -> list[str]:
     return argv
 
 
+def monitor_millimeters(output: Output, mode: Mode, content_w: int, content_h: int) -> tuple[int, int]:
+    """Keep the same DPI when the desktop shrinks, so the menu does not grow huge."""
+    if output.mm_width > 0 and output.mm_height > 0 and mode.width and mode.height:
+        return (
+            max(1, int(round(output.mm_width * content_w / mode.width))),
+            max(1, int(round(output.mm_height * content_h / mode.height))),
+        )
+    return (
+        max(1, int(round(content_w * 25.4 / 96))),
+        max(1, int(round(content_h * 25.4 / 96))),
+    )
+
+
+def menu_monitor_command(output: Output, mode: Mode, margins: Margins) -> list[str]:
+    """Publish only the visible desktop as the monitor Cinnamon lays the menu out on.
+
+    A crisp inset shrinks the framebuffer, but the RandR monitor stays the full
+    HDMI mode. Cinnamon then opens the Super menu on that larger rectangle, so
+    the menu still runs off the edges the TV crops. Naming a monitor that matches
+    the framebuffer pulls the menu back in with the rest of the desktop.
+    """
+    content_w = mode.width - margins.left - margins.right
+    content_h = mode.height - margins.top - margins.bottom
+    mm_w, mm_h = monitor_millimeters(output, mode, content_w, content_h)
+    geometry = f"{content_w}/{mm_w}x{content_h}/{mm_h}+0+0"
+    return ["xrandr", "--setmonitor", f"*{MENU_MONITOR}", geometry, output.name]
+
+
+def clear_menu_monitor_command() -> list[str]:
+    return ["xrandr", "--delmonitor", MENU_MONITOR]
+
+
+def menu_monitor_is_listed(text: str, content_w: int, content_h: int) -> bool:
+    return re.search(rf"{MENU_MONITOR}\s+{content_w}/\d+x{content_h}/\d+\+0\+0", text) is not None
+
+
 def sharp_matrix(margins: Margins) -> str:
     return f"1,0,{-margins.left},0,1,{-margins.top},0,0,1"
 
@@ -683,7 +728,22 @@ def inset_is_active(screen: ScreenInfo, output: Output, margins: Margins, method
     if method in {"auto", "hardware"} and hardware_applied(output, margins):
         return True
     if method in {"auto", "sharp"} and sharp_applied(screen, margins):
-        return True
+        mode = output.current_mode()
+        if mode is None:
+            return False
+        listing = subprocess.run(
+            ["xrandr", "--listactivemonitors"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if listing.returncode != 0:
+            return False
+        return menu_monitor_is_listed(
+            listing.stdout,
+            mode.width - margins.left - margins.right,
+            mode.height - margins.top - margins.bottom,
+        )
     if method == "scale":
         return scale_applied(output, margins)
     return False
@@ -872,6 +932,7 @@ def describe_result(output: Output, mode: Mode, margins: Margins, used: str) -> 
             f"picture pixel. The TV still receives {mode.width}x{mode.height}; "
             "the border is what it was cropping."
         )
+        lines.append("The Super menu is kept inside that area as well.")
     lines.append("Look at the edges with: underscan test")
     lines.append("Keep this at every login with: underscan save")
     return "\n".join(lines)
@@ -891,6 +952,25 @@ def apply_to_output(
     margins = normalize_margins(mode.width, mode.height, margins)
     attempts = plan_apply(screen, output, margins, method)
     used = execute(attempts, margins, dry_run)
+    # The crisp inset leaves RandR advertising the full HDMI mode. Cinnamon
+    # opens the Super menu on that mode, so the menu ignores the inset until
+    # the visible desktop is published as the monitor.
+    if used == "sharp":
+        try:
+            run_command(menu_monitor_command(output, mode, margins), dry_run)
+        except UnderscanError as exc:
+            print(
+                "The picture is inset, but the application menu could not be moved in with it:\n"
+                f"{exc}",
+                file=sys.stderr,
+            )
+    else:
+        # A scaled or hardware inset already covers the menu. Drop a stale
+        # crisp-inset monitor so it is not inset a second time.
+        try:
+            run_command(clear_menu_monitor_command(), dry_run)
+        except UnderscanError:
+            pass
     if pc_mode or (not pc_mode and "content type" in output.props and used != "reset"):
         # Only force content type off when the caller asked. Leaving a TV's
         # current infoframe alone is safer than resetting it on every inset.
@@ -1133,6 +1213,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
         return 0
     output = choose_output(screen, args.output or (saved or {}).get("output"))
     run_command(plan_reset(screen, output), args.dry_run)
+    try:
+        run_command(clear_menu_monitor_command(), args.dry_run)
+    except UnderscanError:
+        pass
     print(f"{output.name} is back to the full HDMI picture.")
     print("It will stay that way at login. `underscan save` turns the last inset back on.")
     return 0
