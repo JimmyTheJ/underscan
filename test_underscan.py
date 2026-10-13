@@ -81,6 +81,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual((mode.width, mode.height, mode.rate), (1920, 1080, "60.00"))
         self.assertTrue(mode.preferred)
         self.assertEqual(output.props["content type"].value, "No Data")
+        self.assertEqual((output.mm_width, output.mm_height), (698, 392))
         self.assertIn("Graphics", output.props["content type"].supported)
         self.assertIn("Limited 16:235", output.props["Broadcast RGB"].supported)
         self.assertFalse(screen.by_name("DP-1").connected)
@@ -141,6 +142,17 @@ class PlanTests(unittest.TestCase):
         self.assertIn("--fb", command)
         self.assertEqual(command[command.index("--fb") + 1], "1728x972")
         self.assertIn("1,0,-96,0,1,-54,0,0,1", command)
+        monitor = underscan.menu_monitor_command(output, output.current_mode(), margins)
+        self.assertEqual(monitor[0:3], ["xrandr", "--setmonitor", "*underscan"])
+        self.assertEqual(monitor[3], "1728/628x972/353+0+0")
+        self.assertEqual(monitor[4], "HDMI-1")
+        self.assertTrue(
+            underscan.menu_monitor_is_listed(
+                "Monitors: 1\n 0: +*underscan 1728/628x972/353+0+0  HDMI-1\n",
+                1728,
+                972,
+            )
+        )
         self.assertIn("HDMI-1", command)
         self.assertIn("60.00", command)
         self.assertEqual(attempts[-1].method, "scale")
