@@ -132,14 +132,36 @@ class MarginTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
-    def test_intel_sharp_command_insets_without_scaling(self):
+    def test_intel_scales_the_full_desktop_so_the_bars_move_in(self):
         screen = underscan.parse_xrandr(INTEL)
         output = screen.by_name("HDMI-1")
         margins = underscan.normalize_margins(1920, 1080, underscan.Margins(96, 96, 54, 54))
         attempts = underscan.plan_apply(screen, output, margins, "auto")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].method, "scale")
+        command = attempts[0].commands[0]
+        self.assertEqual(command[command.index("--fb") + 1], "1920x1080")
+        self.assertIn("bilinear", command)
+        matrix = command[command.index("--transform") + 1].split(",")
+        sx = 1920 / (1920 - 192)
+        sy = 1080 / (1080 - 108)
+        self.assertAlmostEqual(float(matrix[0]), sx, places=5)
+        self.assertAlmostEqual(float(matrix[2]), -sx * 96, places=4)
+        self.assertAlmostEqual(float(matrix[4]), sy, places=5)
+        self.assertAlmostEqual(float(matrix[5]), -sy * 54, places=4)
+        self.assertIn("HDMI-1", command)
+        self.assertIn("60.00", command)
+        described = underscan.describe_result(output, output.current_mode(), margins, "scale")
+        self.assertIn("top and bottom bars", described)
+        self.assertIn("Super menu", described)
+
+    def test_explicit_sharp_still_shrinks_and_publishes_the_menu_monitor(self):
+        screen = underscan.parse_xrandr(INTEL)
+        output = screen.by_name("HDMI-1")
+        margins = underscan.normalize_margins(1920, 1080, underscan.Margins(96, 96, 54, 54))
+        attempts = underscan.plan_apply(screen, output, margins, "sharp")
         command = attempts[0].commands[0]
         self.assertEqual(attempts[0].method, "sharp")
-        self.assertIn("--fb", command)
         self.assertEqual(command[command.index("--fb") + 1], "1728x972")
         self.assertIn("1,0,-96,0,1,-54,0,0,1", command)
         monitor = underscan.menu_monitor_command(output, output.current_mode(), margins)
@@ -153,8 +175,6 @@ class PlanTests(unittest.TestCase):
                 972,
             )
         )
-        self.assertIn("HDMI-1", command)
-        self.assertIn("60.00", command)
         self.assertEqual(attempts[-1].method, "scale")
 
     def test_amd_prefers_hardware_underscan(self):
@@ -162,18 +182,19 @@ class PlanTests(unittest.TestCase):
         output = screen.by_name("HDMI-A-0")
         margins = underscan.Margins(40, 40, 24, 24)
         attempts = underscan.plan_apply(screen, output, margins, "auto")
-        self.assertEqual(attempts[0].method, "hardware")
+        self.assertEqual([attempt.method for attempt in attempts], ["hardware", "scale"])
         command = attempts[0].commands[0]
         self.assertEqual(command[command.index("underscan hborder") + 1], "40")
         self.assertEqual(command[command.index("underscan vborder") + 1], "24")
 
-    def test_asymmetric_amd_uses_the_transform(self):
+    def test_asymmetric_amd_scales_so_the_bars_stay_visible(self):
         screen = underscan.parse_xrandr(AMD)
         output = screen.by_name("HDMI-A-0")
         margins = underscan.Margins(30, 40, 20, 20)
         normalized = underscan.normalize_margins(1920, 1080, margins)
         attempts = underscan.plan_apply(screen, output, normalized, "auto")
-        self.assertEqual(attempts[0].method, "sharp")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].method, "scale")
 
     def test_second_monitor_is_scaled_so_the_desktop_is_not_shrunk(self):
         screen = underscan.parse_xrandr(DUAL)
@@ -221,6 +242,15 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(loaded["output"], "HDMI-1")
                 self.assertEqual(underscan.margins_from_config(loaded), margins)
                 self.assertTrue(json.loads(underscan.config_path().read_text())["enabled"])
+                self.assertEqual(loaded["version"], 2)
+                self.assertEqual(underscan.method_for_panels(loaded), "sharp")
+                old = dict(loaded)
+                old["version"] = 1
+                underscan.save_config(old)
+                self.assertEqual(underscan.upgrade_saved_inset(old), "scale")
+                rewritten = json.loads(underscan.config_path().read_text())
+                self.assertEqual(rewritten["method"], "scale")
+                self.assertEqual(rewritten["version"], 2)
             finally:
                 if previous is None:
                     underscan.os.environ.pop("UNDERSCAN_HOME", None)
