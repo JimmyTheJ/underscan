@@ -3,8 +3,9 @@
 
 Linux Mint's desktop runs on Xorg. Intel chips, including the Beelink Mini S
 (N5095), have no hardware underscan, so this insets the picture with xrandr:
-the TV still gets its normal mode (often 1920x1080) and the desktop sits inside
-it. The border is what the TV's overscan cuts off.
+the TV still gets its normal mode (often 1920x1080) and the whole desktop,
+including the panels and the Super menu, is scaled into the visible middle.
+The border is what the TV's overscan cuts off. The picture is slightly soft.
 
 AMD drivers that expose the underscan property are used when present. A
 Wayland session cannot move the real HDMI picture; log in to Cinnamon on Xorg.
@@ -28,7 +29,7 @@ import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 MIN_CONTENT = (640, 480)
 MAX_FRACTION = 0.25
 RETRY_SECONDS = 45
@@ -631,10 +632,10 @@ def plan_apply(
 
     requested = method
     if requested == "auto":
+        # Scale the full framebuffer. A shrunk desktop leaves the Cinnamon
+        # panels on the full HDMI edge, which is the part the TV crops.
         if hardware_possible(output, margins) is None and len(screen.connected()) == 1:
             requested = "hardware"
-        elif len(screen.connected()) == 1:
-            requested = "sharp"
         else:
             requested = "scale"
 
@@ -645,7 +646,6 @@ def plan_apply(
             raise UnderscanError(f"Cannot use hardware underscan: {reason}.")
         attempts.append(plan_hardware(output, mode, margins))
         if method == "auto":
-            attempts.extend(plan_sharp(screen, output, mode, margins))
             attempts.append(plan_scale(screen, output, mode, margins))
         return attempts
     if requested == "scale":
@@ -727,7 +727,10 @@ def scale_applied(output: Output, margins: Margins) -> bool:
 def inset_is_active(screen: ScreenInfo, output: Output, margins: Margins, method: str) -> bool:
     if method in {"auto", "hardware"} and hardware_applied(output, margins):
         return True
-    if method in {"auto", "sharp"} and sharp_applied(screen, margins):
+    # A shrunk desktop is only "already applied" when the user asked for it.
+    # The default used to be that layout, and it leaves the panels in the
+    # cropped strip, so auto must not treat it as success.
+    if method == "sharp" and sharp_applied(screen, margins):
         mode = output.current_mode()
         if mode is None:
             return False
@@ -744,7 +747,7 @@ def inset_is_active(screen: ScreenInfo, output: Output, margins: Margins, method
             mode.width - margins.left - margins.right,
             mode.height - margins.top - margins.bottom,
         )
-    if method == "scale":
+    if method in {"auto", "scale"}:
         return scale_applied(output, margins)
     return False
 
@@ -916,13 +919,15 @@ def describe_result(output: Output, mode: Mode, margins: Margins, used: str) -> 
     ]
     if used == "hardware":
         lines.append(
-            "The GPU is scaling the full desktop into that visible area. "
+            "The GPU is scaling the full desktop, including the top and bottom bars "
+            "and the Super menu, into that visible area. "
             f"The TV still receives {mode.width}x{mode.height}."
         )
     elif used == "scale":
         lines.append(
-            "The full desktop is scaled into that visible area, so windows stay "
-            f"laid out for {mode.width}x{mode.height}. The picture is slightly soft."
+            "The whole picture, including the top and bottom bars and the Super menu, "
+            "is scaled into that visible area. Windows stay laid out for "
+            f"{mode.width}x{mode.height}. The picture is slightly soft."
         )
     elif used == "reset":
         lines.append("No inset. The desktop goes to the edge of the HDMI picture.")
@@ -932,7 +937,10 @@ def describe_result(output: Output, mode: Mode, margins: Margins, used: str) -> 
             f"picture pixel. The TV still receives {mode.width}x{mode.height}; "
             "the border is what it was cropping."
         )
-        lines.append("The Super menu is kept inside that area as well.")
+        lines.append(
+            "The top and bottom bars and the Super menu stay on the TV edge, "
+            "so the overscan still hides most of them. Run the same inset without --sharp to include them."
+        )
     lines.append("Look at the edges with: underscan test")
     lines.append("Keep this at every login with: underscan save")
     return "\n".join(lines)
@@ -1054,6 +1062,38 @@ def method_from_args(args: argparse.Namespace) -> str:
     return "auto"
 
 
+def method_for_panels(data: dict) -> str:
+    """Return the inset method that keeps the Cinnamon bars on screen.
+
+    Older saves stored ``sharp`` because that used to be the default. That
+    layout leaves the panels on the cropped TV edge. A version-2 save of
+    ``sharp`` is an explicit request and is left alone.
+    """
+    method = str(data.get("method") or "auto")
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version < 2 and method == "sharp":
+        return "scale"
+    return method
+
+
+def upgrade_saved_inset(data: dict, persist: bool = True) -> str:
+    method = method_for_panels(data)
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    changed = str(data.get("method") or "auto") != method or version < CONFIG_VERSION
+    if changed:
+        data["method"] = method
+        data["version"] = CONFIG_VERSION
+        if persist:
+            save_config(data)
+    return method
+
+
 def cmd_set(args: argparse.Namespace) -> int:
     screen = ensure_real_x()
     amount = args.amount
@@ -1104,19 +1144,19 @@ def cmd_save(args: argparse.Namespace) -> int:
     mode = output.current_mode()
     assert mode is not None
     margins = resolved_saved_margins(saved, mode)
-    # Re-read the live picture if the user has been tuning without saving numbers.
-    # The saved file is the source of truth for `underscan save` with no live probe
-    # of margins, because a crisp inset cannot be recovered from the mode alone
-    # once the desktop has already shrunk.
-    used = apply_to_output(
+    # A crisp inset cannot be recovered from the mode alone once the desktop
+    # has already shrunk, so the saved margins stay the source of truth.
+    # Older sharp saves are rewritten to the scaled inset so the bars come in.
+    method = upgrade_saved_inset(saved, persist=not args.dry_run)
+    apply_to_output(
         screen,
         output,
         margins,
-        str(saved.get("method") or "auto"),
+        method,
         bool(saved.get("pc_mode")),
         args.dry_run,
     )
-    cmd_save_values(output, mode, margins, "sharp" if used == "sharp" else str(saved.get("method") or used), bool(saved.get("pc_mode")))
+    cmd_save_values(output, mode, margins, method, bool(saved.get("pc_mode")))
     return 0
 
 
@@ -1143,7 +1183,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         raise UnderscanError("No enabled inset is saved. Run `underscan set` and then `underscan save`.")
     deadline = time.time() + (args.retry or 0)
     announced = False
-    active_method = str(saved.get("method") or "auto")
+    active_method = upgrade_saved_inset(saved, persist=not args.dry_run)
     while True:
         if tuning_in_progress():
             if time.time() >= deadline:
@@ -1172,7 +1212,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 screen,
                 output,
                 margins,
-                str(saved.get("method") or "auto"),
+                active_method,
                 bool(saved.get("pc_mode")),
                 args.dry_run,
             )
@@ -1765,7 +1805,7 @@ def build_parser() -> argparse.ArgumentParser:
             examples:
               underscan test                 see which edges the TV is cutting off
               underscan pc-mode on           ask the TV to treat the input as a PC
-              underscan set 5%               pull every edge in by 5%
+              underscan set 5%               pull every edge in by 5%, bars included
               underscan set 48x27            48px left/right, 27px top/bottom
               underscan tune                 nudge it while looking at the TV
               underscan save                 apply the same inset at every login
@@ -1800,11 +1840,15 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("extra", nargs="?", help=argparse.SUPPRESS)
     set_parser.add_argument("--save", action="store_true", help="also apply this inset at login")
     set_parser.add_argument("--pc-mode", action="store_true", help="also mark the HDMI signal as a computer")
-    set_parser.add_argument("--sharp", action="store_true", help="shrink the desktop so pixels stay 1:1")
+    set_parser.add_argument(
+        "--sharp",
+        action="store_true",
+        help="keep pixels 1:1; the panel and menu stay on the cropped TV edge",
+    )
     set_parser.add_argument(
         "--keep-resolution",
         action="store_true",
-        help="scale the current desktop into the visible area instead of shrinking it",
+        help="scale the desktop into the visible area, including the bars (this is the default)",
     )
 
     tune = sub.add_parser("tune", parents=[common], help="nudge the inset from the keyboard while looking at the TV")
