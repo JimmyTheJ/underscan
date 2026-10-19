@@ -487,8 +487,57 @@ def clear_menu_monitor_command() -> list[str]:
     return ["xrandr", "--delmonitor", MENU_MONITOR]
 
 
-def menu_monitor_is_listed(text: str, content_w: int, content_h: int) -> bool:
-    return re.search(rf"{MENU_MONITOR}\s+{content_w}/\d+x{content_h}/\d+\+0\+0", text) is not None
+def menu_monitor_is_listed(
+    text: str,
+    width: int,
+    height: int,
+    x: int = 0,
+    y: int = 0,
+) -> bool:
+    return re.search(rf"{MENU_MONITOR}\s+{width}/\d+x{height}/\d+\+{x}\+{y}", text) is not None
+
+
+def scale_monitor_origin(screen: ScreenInfo, output: Output) -> tuple[int, int]:
+    """Where the mode-sized desktop sits in the framebuffer."""
+    if len(screen.connected()) == 1:
+        return 0, 0
+    return output.x, output.y
+
+
+def scale_monitor_command(screen: ScreenInfo, output: Output, mode: Mode) -> list[str]:
+    """Keep Cinnamon on the HDMI mode, not the transform's expanded scanout.
+
+    The scale matrix maps the full mode into the visible middle of the signal.
+    RandR then advertises a CRTC larger than that mode, shifted off the origin.
+    If the shell lays the panels out on that CRTC, a bigger inset slides the
+    far edges back off the TV: the near edge moves inward and the far edge
+    moves out. A monitor the size of the mode is the rectangle the matrix
+    actually letterboxes, so a larger inset keeps pulling every edge in.
+    """
+    mm_w, mm_h = monitor_millimeters(output, mode, mode.width, mode.height)
+    x, y = scale_monitor_origin(screen, output)
+    geometry = f"{mode.width}/{mm_w}x{mode.height}/{mm_h}+{x}+{y}"
+    return ["xrandr", "--setmonitor", f"*{MENU_MONITOR}", geometry, output.name]
+
+
+def scale_restore_commands(
+    screen: ScreenInfo,
+    output: Output,
+    mode: Mode,
+    margins: Margins,
+) -> list[list[str]]:
+    """Put a single display back on the HDMI mode after the shell grows it.
+
+    The scale transform's scanout is larger than the mode. A shell that
+    resizes the framebuffer to that scanout slides the far edges outward as
+    the inset grows. Reapply the mode-sized framebuffer and monitor.
+    """
+    if len(screen.connected()) != 1:
+        return []
+    if screen.width == mode.width and screen.height == mode.height:
+        return []
+    attempt = plan_scale(screen, output, mode, margins)
+    return [*attempt.commands, scale_monitor_command(screen, output, mode)]
 
 
 def sharp_matrix(margins: Margins) -> str:
@@ -496,6 +545,12 @@ def sharp_matrix(margins: Margins) -> str:
 
 
 def scale_matrix(mode: Mode, margins: Margins) -> str:
+    """Map output pixels onto a mode-sized framebuffer, leaving the border outside it.
+
+    Output pixel ``left`` samples framebuffer 0, and output pixel ``width - right``
+    samples the far edge. Both insets grow when the margins grow. That holds only
+    while the desktop stays the mode size; see ``scale_monitor_command``.
+    """
     visible_w = mode.width - margins.left - margins.right
     visible_h = mode.height - margins.top - margins.bottom
     sx = mode.width / visible_w
@@ -547,6 +602,8 @@ def plan_sharp(screen: ScreenInfo, output: Output, mode: Mode, margins: Margins)
 def plan_scale(screen: ScreenInfo, output: Output, mode: Mode, margins: Margins) -> Attempt:
     single = len(screen.connected()) == 1
     if single:
+        # The shell must keep laying windows out on this mode. The transform
+        # scanout is larger; the mode-sized monitor pins the desktop here.
         fb = f"{mode.width}x{mode.height}"
         position = ["--pos", "0x0"]
     else:
@@ -748,8 +805,34 @@ def inset_is_active(screen: ScreenInfo, output: Output, margins: Margins, method
             mode.height - margins.top - margins.bottom,
         )
     if method in {"auto", "scale"}:
-        return scale_applied(output, margins)
+        return scale_layout_is_active(screen, output, margins)
     return False
+
+
+def scale_layout_is_active(screen: ScreenInfo, output: Output, margins: Margins) -> bool:
+    """True when the letterbox is up and the desktop is still the HDMI mode.
+
+    A shell that stretches the desktop to the transform scanout undoes the
+    far edge of the inset. That shows up as a framebuffer bigger than the
+    mode, or as no mode-sized monitor.
+    """
+    if not scale_applied(output, margins):
+        return False
+    mode = output.current_mode()
+    if mode is None:
+        return False
+    if len(screen.connected()) == 1 and (screen.width != mode.width or screen.height != mode.height):
+        return False
+    listing = subprocess.run(
+        ["xrandr", "--listactivemonitors"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if listing.returncode != 0:
+        return False
+    x, y = scale_monitor_origin(screen, output)
+    return menu_monitor_is_listed(listing.stdout, mode.width, mode.height, x, y)
 
 
 def verify_attempt(attempt: Attempt, margins: Margins) -> bool:
@@ -946,6 +1029,46 @@ def describe_result(output: Output, mode: Mode, margins: Margins, used: str) -> 
     return "\n".join(lines)
 
 
+def publish_scale_monitor(screen: ScreenInfo, output: Output, mode: Mode, dry_run: bool) -> bool:
+    try:
+        run_command(scale_monitor_command(screen, output, mode), dry_run)
+    except UnderscanError as exc:
+        print(
+            "The desktop could not be kept on the HDMI mode.\n"
+            "A larger inset may slide the far edges back off the TV.\n"
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def restore_grown_scale_desktop(output: Output, mode: Mode, margins: Margins, dry_run: bool) -> None:
+    """Shrink a framebuffer the shell already stretched onto the scanout."""
+    if dry_run:
+        return
+    try:
+        fresh = query()
+    except UnderscanError:
+        return
+    fresh_output = fresh.by_name(output.name)
+    if fresh_output is None:
+        return
+    commands = scale_restore_commands(fresh, fresh_output, mode, margins)
+    if not commands:
+        return
+    try:
+        for command in commands:
+            run_command(command, dry_run)
+    except UnderscanError as exc:
+        print(
+            "The picture is inset, but the desktop grew past the HDMI mode.\n"
+            "A larger inset may slide the far edges back off the TV.\n"
+            f"{exc}",
+            file=sys.stderr,
+        )
+
+
 def apply_to_output(
     screen: ScreenInfo,
     output: Output,
@@ -959,6 +1082,12 @@ def apply_to_output(
         raise UnderscanError(f"{output.name} has no active mode.")
     margins = normalize_margins(mode.width, mode.height, margins)
     attempts = plan_apply(screen, output, margins, method)
+    # Name the mode before the transform. The scanout rectangle is larger
+    # than the mode; if the shell sees that first, it lays the desktop on
+    # the scanout and a bigger inset pushes the far edges off the TV.
+    pinned = False
+    if attempts and attempts[0].method == "scale":
+        pinned = publish_scale_monitor(screen, output, mode, dry_run)
     used = execute(attempts, margins, dry_run)
     # The crisp inset leaves RandR advertising the full HDMI mode. Cinnamon
     # opens the Super menu on that mode, so the menu ignores the inset until
@@ -972,9 +1101,13 @@ def apply_to_output(
                 f"{exc}",
                 file=sys.stderr,
             )
+    elif used == "scale":
+        if not pinned:
+            publish_scale_monitor(screen, output, mode, dry_run)
+        restore_grown_scale_desktop(output, mode, margins, dry_run)
     else:
-        # A scaled or hardware inset already covers the menu. Drop a stale
-        # crisp-inset monitor so it is not inset a second time.
+        # Hardware underscan does not expand the CRTC. Drop a stale monitor
+        # so the menu is not inset a second time.
         try:
             run_command(clear_menu_monitor_command(), dry_run)
         except UnderscanError:

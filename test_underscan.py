@@ -7,6 +7,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 loader = importlib.machinery.SourceFileLoader("underscan", str(ROOT / "underscan"))
@@ -222,6 +223,108 @@ class PlanTests(unittest.TestCase):
         screen.width, screen.height = 1728, 972
         self.assertTrue(underscan.sharp_applied(screen, underscan.Margins(96, 96, 54, 54)))
         self.assertFalse(underscan.sharp_applied(screen, underscan.Margins(10, 10, 10, 10)))
+
+    def test_scale_pins_the_desktop_to_the_hdmi_mode(self):
+        screen = underscan.parse_xrandr(INTEL)
+        output = screen.by_name("HDMI-1")
+        mode = output.current_mode()
+        monitor = underscan.scale_monitor_command(screen, output, mode)
+        self.assertEqual(
+            monitor,
+            ["xrandr", "--setmonitor", "*underscan", "1920/698x1080/392+0+0", "HDMI-1"],
+        )
+        self.assertTrue(
+            underscan.menu_monitor_is_listed(
+                "Monitors: 1\n 0: +*underscan 1920/698x1080/392+0+0  HDMI-1\n",
+                1920,
+                1080,
+            )
+        )
+        dual = underscan.parse_xrandr(DUAL)
+        other = dual.by_name("DP-1")
+        placed = underscan.scale_monitor_command(dual, other, other.current_mode())
+        self.assertEqual(placed[3], "1920/530x1080/300+1920+0")
+
+    def test_larger_inset_keeps_every_edge_moving_inward(self):
+        mode = underscan.parse_xrandr(INTEL).by_name("HDMI-1").current_mode()
+        mild = underscan.Margins(48, 48, 20, 20)
+        strong = underscan.Margins(80, 80, 40, 40)
+        mild_insets = signal_insets(mode, mild, mode.width, mode.height)
+        strong_insets = signal_insets(mode, strong, mode.width, mode.height)
+        for edge, larger in zip(mild_insets, strong_insets):
+            self.assertGreater(edge, 0)
+            self.assertGreater(larger, edge)
+
+        # RandR's scanout for this matrix is larger than the mode. A desktop
+        # laid out on that rectangle reverses the far edges.
+        mild_scale = matrix_terms(mode, mild)
+        self.assertGreater(mild_scale[0] * mode.width, mode.width)
+        grown = signal_insets(mode, mild, mild_scale[0] * mode.width, mild_scale[1] * mode.height)
+        strong_scale = matrix_terms(mode, strong)
+        grown_more = signal_insets(
+            mode,
+            strong,
+            strong_scale[0] * mode.width,
+            strong_scale[1] * mode.height,
+        )
+        self.assertGreater(grown[0], 0)
+        self.assertLess(grown[1], 0)
+        self.assertLess(grown_more[1], grown[1])
+        self.assertLess(grown_more[3], grown[3])
+
+    def test_grown_framebuffer_is_put_back_on_the_mode(self):
+        screen = underscan.parse_xrandr(INTEL)
+        output = screen.by_name("HDMI-1")
+        mode = output.current_mode()
+        margins = underscan.Margins(80, 80, 40, 40)
+        self.assertEqual(underscan.scale_restore_commands(screen, output, mode, margins), [])
+        screen.width, screen.height = 2095, 1166
+        commands = underscan.scale_restore_commands(screen, output, mode, margins)
+        self.assertEqual(commands[0][commands[0].index("--fb") + 1], "1920x1080")
+        self.assertEqual(commands[-1][3], "1920/698x1080/392+0+0")
+        dual = underscan.parse_xrandr(DUAL)
+        dual.width, dual.height = 4000, 1200
+        self.assertEqual(
+            underscan.scale_restore_commands(dual, dual.by_name("HDMI-1"), mode, margins),
+            [],
+        )
+
+    def test_scale_layout_requires_the_mode_sized_monitor(self):
+        screen = underscan.parse_xrandr(INTEL)
+        output = screen.by_name("HDMI-1")
+        margins = underscan.Margins(48, 48, 20, 20)
+        grown = underscan.parse_xrandr(INTEL)
+        grown.width, grown.height = 2022, 1122
+        with mock.patch.object(underscan, "scale_applied", return_value=True):
+            self.assertFalse(underscan.scale_layout_is_active(grown, output, margins))
+            missing = mock.Mock(returncode=0, stdout="Monitors: 0\n")
+            listed = mock.Mock(
+                returncode=0,
+                stdout="Monitors: 1\n 0: +*underscan 1920/698x1080/392+0+0  HDMI-1\n",
+            )
+            with mock.patch.object(underscan.subprocess, "run", return_value=missing):
+                self.assertFalse(underscan.scale_layout_is_active(screen, output, margins))
+            with mock.patch.object(underscan.subprocess, "run", return_value=listed):
+                self.assertTrue(underscan.scale_layout_is_active(screen, output, margins))
+
+
+def matrix_terms(mode, margins):
+    parts = [float(part) for part in underscan.scale_matrix(mode, margins).split(",")]
+    return parts[0], parts[4]
+
+
+def signal_insets(mode, margins, desktop_w, desktop_h):
+    """How far each desktop edge sits inside the HDMI signal.
+
+    Positive is inside the signal. Negative has crossed that edge.
+    """
+    parts = [float(part) for part in underscan.scale_matrix(mode, margins).split(",")]
+    sx, tx, sy, ty = parts[0], parts[2], parts[4], parts[5]
+    left = (0 - tx) / sx
+    right = mode.width - (desktop_w - tx) / sx
+    top = (0 - ty) / sy
+    bottom = mode.height - (desktop_h - ty) / sy
+    return left, right, top, bottom
 
 
 class ConfigTests(unittest.TestCase):
